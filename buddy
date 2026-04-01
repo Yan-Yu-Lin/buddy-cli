@@ -1,0 +1,834 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["click", "rich"]
+# ///
+"""
+buddy — Claude Code companion reroller & manager v2.0
+
+Search, preview, patch, and customize your Claude Code buddy companion.
+Uses SALT replacement for native binary (Bun.hash) and UUID patching for npm (FNV-1a).
+"""
+
+import ctypes
+import json
+import math
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import click
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+console = Console()
+
+# ── Constants (exact match of Claude Code source) ──
+
+VERSION = "2.0.0"
+ORIGINAL_SALT = "friend-2026-401"
+SALT_LEN = len(ORIGINAL_SALT)
+
+SPECIES = [
+    "duck", "goose", "blob", "cat", "dragon", "octopus", "owl", "penguin",
+    "turtle", "snail", "ghost", "axolotl", "capybara", "cactus", "robot",
+    "rabbit", "mushroom", "chonk",
+]
+EYES = ["·", "✦", "×", "◉", "@", "°"]
+EYE_NAMES = {"·": "dot", "✦": "star", "×": "cross", "◉": "bullseye", "@": "at", "°": "circle"}
+HATS = ["none", "crown", "tophat", "propeller", "halo", "wizard", "beanie", "tinyduck"]
+RARITIES = ["common", "uncommon", "rare", "epic", "legendary"]
+RARITY_WEIGHTS = {"common": 60, "uncommon": 25, "rare": 10, "epic": 4, "legendary": 1}
+RARITY_FLOOR = {"common": 5, "uncommon": 15, "rare": 25, "epic": 35, "legendary": 50}
+RARITY_STARS = {"common": "★", "uncommon": "★★", "rare": "★★★", "epic": "★★★★", "legendary": "★★★★★"}
+RARITY_COLORS = {"common": "dim", "uncommon": "green", "rare": "blue", "epic": "magenta", "legendary": "yellow"}
+STAT_NAMES = ["DEBUGGING", "PATIENCE", "CHAOS", "WISDOM", "SNARK"]
+
+HAT_LINES = {
+    "none": "",
+    "crown": "   \\^^^/    ",
+    "tophat": "   [___]    ",
+    "propeller": "    -+-     ",
+    "halo": "   (   )    ",
+    "wizard": "    /^\\     ",
+    "beanie": "   (___)    ",
+    "tinyduck": "    ,>      ",
+}
+
+# ── Sprite data (ported from sprites.ts) ──
+# Each species has 3 frames, each frame is 5 lines, 12 chars wide
+# {E} = eye placeholder
+
+BODIES = {
+    "duck": [
+        ["            ", "    __      ", "  <({E} )___  ", "   (  ._>   ", "    `--´    "],
+        ["            ", "    __      ", "  <({E} )___  ", "   (  ._>   ", "    `--´~   "],
+        ["            ", "    __      ", "  <({E} )___  ", "   (  .__>  ", "    `--´    "],
+    ],
+    "goose": [
+        ["            ", "     ({E}>    ", "     ||     ", "   _(__)_   ", "    ^^^^    "],
+        ["            ", "    ({E}>     ", "     ||     ", "   _(__)_   ", "    ^^^^    "],
+        ["            ", "     ({E}>>   ", "     ||     ", "   _(__)_   ", "    ^^^^    "],
+    ],
+    "blob": [
+        ["            ", "   .----.   ", "  ( {E}  {E} )  ", "  (      )  ", "   `----´   "],
+        ["            ", "  .------.  ", " (  {E}  {E}  ) ", " (        ) ", "  `------´  "],
+        ["            ", "    .--.    ", "   ({E}  {E})   ", "   (    )   ", "    `--´    "],
+    ],
+    "cat": [
+        ["            ", "   /\\_/\\    ", "  ( {E}   {E})  ", "  (  ω  )   ", '  (")_(")   '],
+        ["            ", "   /\\_/\\    ", "  ( {E}   {E})  ", "  (  ω  )   ", '  (")_(")~  '],
+        ["            ", "   /\\-/\\    ", "  ( {E}   {E})  ", "  (  ω  )   ", '  (")_(")   '],
+    ],
+    "dragon": [
+        ["            ", "  /^\\  /^\\  ", " <  {E}  {E}  > ", " (   ~~   ) ", "  `-vvvv-´  "],
+        ["            ", "  /^\\  /^\\  ", " <  {E}  {E}  > ", " (        ) ", "  `-vvvv-´  "],
+        ["   ~    ~   ", "  /^\\  /^\\  ", " <  {E}  {E}  > ", " (   ~~   ) ", "  `-vvvv-´  "],
+    ],
+    "octopus": [
+        ["            ", "   .----.   ", "  ( {E}  {E} )  ", "  (______)  ", "  /\\/\\/\\/\\  "],
+        ["            ", "   .----.   ", "  ( {E}  {E} )  ", "  (______)  ", "  \\/\\/\\/\\/  "],
+        ["     o      ", "   .----.   ", "  ( {E}  {E} )  ", "  (______)  ", "  /\\/\\/\\/\\  "],
+    ],
+    "owl": [
+        ["            ", "   /\\  /\\   ", "  (({E})({E}))  ", "  (  ><  )  ", "   `----´   "],
+        ["            ", "   /\\  /\\   ", "  (({E})({E}))  ", "  (  ><  )  ", "   .----.   "],
+        ["            ", "   /\\  /\\   ", "  (({E})(-))  ", "  (  ><  )  ", "   `----´   "],
+    ],
+    "penguin": [
+        ["            ", "  .---.     ", "  ({E}>{E})     ", " /(   )\\    ", "  `---´     "],
+        ["            ", "  .---.     ", "  ({E}>{E})     ", " |(   )|    ", "  `---´     "],
+        ["  .---.     ", "  ({E}>{E})     ", " /(   )\\    ", "  `---´     ", "   ~ ~      "],
+    ],
+    "turtle": [
+        ["            ", "   _,--._   ", "  ( {E}  {E} )  ", " /[______]\\ ", "  ``    ``  "],
+        ["            ", "   _,--._   ", "  ( {E}  {E} )  ", " /[______]\\ ", "   ``  ``   "],
+        ["            ", "   _,--._   ", "  ( {E}  {E} )  ", " /[======]\\ ", "  ``    ``  "],
+    ],
+    "snail": [
+        ["            ", " {E}    .--.  ", "  \\  ( @ )  ", "   \\_`--´   ", "  ~~~~~~~   "],
+        ["            ", "  {E}   .--.  ", "  |  ( @ )  ", "   \\_`--´   ", "  ~~~~~~~   "],
+        ["            ", " {E}    .--.  ", "  \\  ( @  ) ", "   \\_`--´   ", "   ~~~~~~   "],
+    ],
+    "ghost": [
+        ["            ", "   .----.   ", "  / {E}  {E} \\  ", "  |      |  ", "  ~`~``~`~  "],
+        ["            ", "   .----.   ", "  / {E}  {E} \\  ", "  |      |  ", "  `~`~~`~`  "],
+        ["    ~  ~    ", "   .----.   ", "  / {E}  {E} \\  ", "  |      |  ", "  ~~`~~`~~  "],
+    ],
+    "axolotl": [
+        ["            ", "}~(______)~{", "}~({E} .. {E})~{", "  ( .--. )  ", "  (_/  \\_)  "],
+        ["            ", "~}(______){~", "~}({E} .. {E}){~", "  ( .--. )  ", "  (_/  \\_)  "],
+        ["            ", "}~(______)~{", "}~({E} .. {E})~{", "  (  --  )  ", "  ~_/  \\_~  "],
+    ],
+    "capybara": [
+        ["            ", "  n______n  ", " ( {E}    {E} ) ", " (   oo   ) ", "  `------´  "],
+        ["            ", "  n______n  ", " ( {E}    {E} ) ", " (   Oo   ) ", "  `------´  "],
+        ["    ~  ~    ", "  u______n  ", " ( {E}    {E} ) ", " (   oo   ) ", "  `------´  "],
+    ],
+    "cactus": [
+        ["            ", " n  ____  n ", " | |{E}  {E}| | ", " |_|    |_| ", "   |    |   "],
+        ["            ", "    ____    ", " n |{E}  {E}| n ", " |_|    |_| ", "   |    |   "],
+        [" n        n ", " |  ____  | ", " | |{E}  {E}| | ", " |_|    |_| ", "   |    |   "],
+    ],
+    "robot": [
+        ["            ", "   .[||].   ", "  [ {E}  {E} ]  ", "  [ ==== ]  ", "  `------´  "],
+        ["            ", "   .[||].   ", "  [ {E}  {E} ]  ", "  [ -==- ]  ", "  `------´  "],
+        ["     *      ", "   .[||].   ", "  [ {E}  {E} ]  ", "  [ ==== ]  ", "  `------´  "],
+    ],
+    "rabbit": [
+        ["            ", "   (\\__/)   ", "  ( {E}  {E} )  ", " =(  ..  )= ", '  (")__(")  '],
+        ["            ", "   (|__/)   ", "  ( {E}  {E} )  ", " =(  ..  )= ", '  (")__(")  '],
+        ["            ", "   (\\__/)   ", "  ( {E}  {E} )  ", " =( .  . )= ", '  (")__(")  '],
+    ],
+    "mushroom": [
+        ["            ", " .-o-OO-o-. ", "(__________)", "   |{E}  {E}|   ", "   |____|   "],
+        ["            ", " .-O-oo-O-. ", "(__________)", "   |{E}  {E}|   ", "   |____|   "],
+        ["   . o  .   ", " .-o-OO-o-. ", "(__________)", "   |{E}  {E}|   ", "   |____|   "],
+    ],
+    "chonk": [
+        ["            ", "  /\\    /\\  ", " ( {E}    {E} ) ", " (   ..   ) ", "  `------´  "],
+        ["            ", "  /\\    /|  ", " ( {E}    {E} ) ", " (   ..   ) ", "  `------´  "],
+        ["            ", "  /\\    /\\  ", " ( {E}    {E} ) ", " (   ..   ) ", "  `------´~ "],
+    ],
+}
+
+
+# ── Paths ──
+
+def get_claude_binary() -> Path:
+    link = Path(os.environ.get("CLAUDE_LINK", Path.home() / ".local/bin/claude"))
+    if link.is_symlink():
+        return link.resolve()
+    return link
+
+def get_backup_path() -> Path:
+    return get_claude_binary().with_suffix(get_claude_binary().suffix + ".buddy-bak")
+
+def get_salt_file() -> Path:
+    return get_claude_binary().with_suffix(get_claude_binary().suffix + ".buddy-salt")
+
+def get_config_path(runtime: str = "native") -> Path:
+    if runtime == "npm":
+        p = Path.home() / ".claude-sneakpeek/claudesp/config/.claude.json"
+        if p.exists():
+            return p
+    p = Path.home() / ".claude.json"
+    if p.exists():
+        return p
+    p = Path.home() / ".claude/.config.json"
+    if p.exists():
+        return p
+    console.print("[red]Error: no claude config found[/]")
+    sys.exit(1)
+
+def get_npm_cli_js() -> Path:
+    return Path.home() / ".claude-sneakpeek/claudesp/npm/node_modules/@anthropic-ai/claude-code/cli.js"
+
+
+# ── Config ──
+
+def read_config(runtime: str = "native") -> dict:
+    return json.loads(get_config_path(runtime).read_text())
+
+def write_config(config: dict, runtime: str = "native"):
+    get_config_path(runtime).write_text(json.dumps(config, indent=2))
+
+def get_user_id(runtime: str = "native") -> str:
+    c = read_config(runtime)
+    return c.get("oauthAccount", {}).get("accountUuid") or c.get("userID") or "anon"
+
+def get_current_salt() -> str:
+    sf = get_salt_file()
+    if sf.exists():
+        return sf.read_text().strip()
+    return ORIGINAL_SALT
+
+
+# ── Roll engine (Python FNV-1a for npm, Bun bridge for native) ──
+
+def fnv1a_hash(s: str) -> int:
+    h = 2166136261
+    for ch in s:
+        h ^= ord(ch)
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+def imul(a: int, b: int) -> int:
+    """Emulate JavaScript Math.imul — uint32 multiply, lower 32 bits."""
+    return ((a & 0xFFFFFFFF) * (b & 0xFFFFFFFF)) & 0xFFFFFFFF
+
+def _to_int32(v: int) -> int:
+    v = v & 0xFFFFFFFF
+    return v - 0x100000000 if v >= 0x80000000 else v
+
+def mulberry32(seed: int):
+    a = seed & 0xFFFFFFFF
+    def next_val():
+        nonlocal a
+        a = _to_int32(a)
+        a = _to_int32((a + 0x6D2B79F5) & 0xFFFFFFFF)
+        a_u = a & 0xFFFFFFFF
+        t = _to_int32(imul(a_u ^ (a_u >> 15), (1 | a) & 0xFFFFFFFF))
+        t_u = t & 0xFFFFFFFF
+        mul_result = imul(t_u ^ (t_u >> 7), (61 | t) & 0xFFFFFFFF)
+        sum_result = _to_int32((t + mul_result) & 0xFFFFFFFF)
+        t = sum_result ^ t
+        t_u2 = t & 0xFFFFFFFF
+        return ((t_u2 ^ (t_u2 >> 14)) & 0xFFFFFFFF) / 4294967296
+    return next_val
+
+def pick(rng, arr):
+    return arr[int(rng() * len(arr))]
+
+def roll_rarity(rng):
+    roll = rng() * 100
+    for r in RARITIES:
+        roll -= RARITY_WEIGHTS[r]
+        if roll < 0:
+            return r
+    return "common"
+
+def roll_stats(rng, rarity):
+    floor = RARITY_FLOOR[rarity]
+    peak = pick(rng, STAT_NAMES)
+    dump = pick(rng, STAT_NAMES)
+    while dump == peak:
+        dump = pick(rng, STAT_NAMES)
+    stats = {}
+    for name in STAT_NAMES:
+        if name == peak:
+            stats[name] = min(100, floor + 50 + int(rng() * 30))
+        elif name == dump:
+            stats[name] = max(1, floor - 10 + int(rng() * 15))
+        else:
+            stats[name] = floor + int(rng() * 40)
+    return stats
+
+def roll_companion(user_id: str, salt: str, use_bun: bool = False) -> dict:
+    key = user_id + salt
+    if use_bun:
+        h = bun_hash(key)
+    else:
+        h = fnv1a_hash(key)
+    rng = mulberry32(h)
+    rarity = roll_rarity(rng)
+    species = pick(rng, SPECIES)
+    eye = pick(rng, EYES)
+    hat = "none" if rarity == "common" else pick(rng, HATS)
+    shiny = rng() < 0.01
+    stats = roll_stats(rng, rarity)
+    return {"salt": salt, "rarity": rarity, "species": species, "eye": eye,
+            "hat": hat, "shiny": shiny, "stats": stats}
+
+
+# ── Bun hash bridge (for native binary accuracy) ──
+
+_bun_hash_cache: dict[str, int] = {}
+
+def bun_hash(s: str) -> int:
+    if s in _bun_hash_cache:
+        return _bun_hash_cache[s]
+    # Escape for JS string
+    escaped = s.replace("\\", "\\\\").replace("'", "\\'")
+    result = subprocess.run(
+        ["bun", "-e", f"console.log(Number(BigInt(Bun.hash('{escaped}')) & 0xffffffffn))"],
+        capture_output=True, text=True, timeout=5,
+    )
+    h = int(result.stdout.strip())
+    _bun_hash_cache[s] = h
+    return h
+
+
+# ── Sprite rendering ──
+
+def render_sprite(species: str, eye: str, hat: str, frame: int = 0) -> list[str]:
+    frames = BODIES.get(species, BODIES["blob"])
+    body = [line.replace("{E}", eye) for line in frames[frame % len(frames)]]
+    lines = list(body)
+    if hat != "none" and not lines[0].strip():
+        hat_line = HAT_LINES.get(hat, "")
+        if hat_line:
+            lines[0] = hat_line
+    # Drop blank hat slot if all frames have blank line 0 and no hat
+    if not lines[0].strip() and all(not f[0].strip() for f in frames):
+        lines.pop(0)
+    return lines
+
+
+# ── Display ──
+
+def render_card(r: dict, show_salt: bool = True, show_sprite: bool = True) -> str:
+    color = RARITY_COLORS[r["rarity"]]
+    stars = RARITY_STARS[r["rarity"]]
+    shiny_text = "  ✨ SHINY ✨" if r["shiny"] else ""
+    lines = []
+    lines.append(f"[{color} bold]{stars} {r['rarity'].upper()}[/]  [bold]{r['species'].upper()}[/]{shiny_text}")
+    lines.append(f"  Eye: {r['eye']} ({EYE_NAMES.get(r['eye'], '?')})  Hat: {r['hat']}")
+    lines.append("")
+
+    if show_sprite:
+        sprite = render_sprite(r["species"], r["eye"], r["hat"])
+        for sl in sprite:
+            lines.append(f"  [{color}]{sl}[/]")
+        lines.append("")
+
+    for stat_name in STAT_NAMES:
+        v = r["stats"][stat_name]
+        filled = round(v / 5)
+        bar = "█" * filled + "░" * (20 - filled)
+        lines.append(f"  {stat_name:<12} {bar} {v}")
+
+    if show_salt:
+        lines.append(f"\n  [dim]Salt: {r['salt']}[/]")
+    return "\n".join(lines)
+
+
+# ── Search engine (Bun-powered for native, Python for npm) ──
+
+BUN_SEARCH_TEMPLATE = """
+const USER_ID = {user_id_json};
+const TERMS = {terms_json};
+const MAX_RESULTS = {max_results};
+const MAX_SEARCH = {max_search};
+const MIN_STATS = {min_stats_json};
+const SORT_STAT = {sort_stat_json};
+const SALT_LEN = {salt_len};
+
+const SPECIES = {species_json};
+const EYES = ['·','✦','×','◉','@','°'];
+const EYE_NAMES = {eye_names_json};
+const HATS = {hats_json};
+const RARITIES = ['common','uncommon','rare','epic','legendary'];
+const RARITY_WEIGHTS = {{common:60,uncommon:25,rare:10,epic:4,legendary:1}};
+const STAT_NAMES = ['DEBUGGING','PATIENCE','CHAOS','WISDOM','SNARK'];
+const RARITY_FLOOR = {{common:5,uncommon:15,rare:25,epic:35,legendary:50}};
+
+function hashString(s) {{ return Number(BigInt(Bun.hash(s)) & 0xffffffffn); }}
+function mulberry32(seed) {{
+  let a = seed >>> 0;
+  return () => {{ a|=0;a=(a+0x6d2b79f5)|0;let t=Math.imul(a^(a>>>15),1|a);
+    t=(t+Math.imul(t^(t>>>7),61|t))^t;return((t^(t>>>14))>>>0)/4294967296; }};
+}}
+function pick(rng,arr) {{ return arr[Math.floor(rng()*arr.length)]; }}
+function rollRarity(rng) {{ let r=rng()*100;for(const x of RARITIES){{r-=RARITY_WEIGHTS[x];if(r<0)return x;}}return'common'; }}
+function rollStats(rng,rarity) {{
+  const floor=RARITY_FLOOR[rarity],peak=pick(rng,STAT_NAMES);
+  let dump=pick(rng,STAT_NAMES);while(dump===peak)dump=pick(rng,STAT_NAMES);
+  const s={{}};for(const n of STAT_NAMES){{
+    if(n===peak)s[n]=Math.min(100,floor+50+Math.floor(rng()*30));
+    else if(n===dump)s[n]=Math.max(1,floor-10+Math.floor(rng()*15));
+    else s[n]=floor+Math.floor(rng()*40);
+  }}return s;
+}}
+function roll(salt) {{
+  const rng=mulberry32(hashString(USER_ID+salt));
+  const rarity=rollRarity(rng),species=pick(rng,SPECIES),eye=pick(rng,EYES);
+  const hat=rarity==='common'?'none':pick(rng,HATS),shiny=rng()<0.01;
+  const stats=rollStats(rng,rarity);
+  return {{salt,rarity,species,eye,hat,shiny,stats}};
+}}
+function matches(r, terms) {{
+  const pool=[r.rarity,r.species,r.eye,EYE_NAMES[r.eye]||'',r.hat,r.shiny?'shiny':''].map(x=>x.toLowerCase());
+  return terms.every(t=>pool.some(p=>p.includes(t)));
+}}
+function passesMinStats(r) {{
+  for (const [k,v] of Object.entries(MIN_STATS)) {{
+    if ((r.stats[k]||0) < v) return false;
+  }}
+  return true;
+}}
+const crypto=require('node:crypto');
+const results=[];
+let searched=0;
+while(results.length<MAX_RESULTS && searched<MAX_SEARCH) {{
+  const salt=crypto.randomBytes(12).toString('base64url').slice(0,SALT_LEN);
+  const r=roll(salt); searched++;
+  if(matches(r,TERMS) && passesMinStats(r)) {{
+    results.push(r);
+    console.log(JSON.stringify(r));
+  }}
+  if(searched%5000000===0 && results.length<MAX_RESULTS)
+    process.stderr.write('  ...'+searched.toLocaleString()+' searched, '+results.length+' found\\n');
+}}
+if(results.length===0) process.stderr.write('No matches in '+searched.toLocaleString()+' rolls.\\n');
+else process.stderr.write('Found '+results.length+' in '+searched.toLocaleString()+' rolls.\\n');
+"""
+
+
+def run_bun_search(user_id: str, terms: list[str], max_results: int = 25,
+                   max_search: int = 50_000_000, min_stats: dict | None = None,
+                   sort_stat: str | None = None) -> list[dict]:
+    script = BUN_SEARCH_TEMPLATE.format(
+        user_id_json=json.dumps(user_id),
+        terms_json=json.dumps(terms),
+        max_results=max_results,
+        max_search=max_search,
+        min_stats_json=json.dumps(min_stats or {}),
+        sort_stat_json=json.dumps(sort_stat),
+        salt_len=SALT_LEN,
+        species_json=json.dumps(SPECIES),
+        eye_names_json=json.dumps(EYE_NAMES),
+        hats_json=json.dumps(HATS),
+    )
+    proc = subprocess.Popen(
+        ["bun", "run", "-"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, stderr = proc.communicate(input=script, timeout=120)
+    if stderr:
+        console.print(f"[dim]{stderr.strip()}[/]", highlight=False)
+    results = []
+    for line in stdout.strip().split("\n"):
+        if line.strip():
+            try:
+                results.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    if sort_stat and results:
+        results.sort(key=lambda r: r["stats"].get(sort_stat, 0), reverse=True)
+    return results
+
+
+# ── Patching ──
+
+def patch_native(new_salt: str):
+    binary = get_claude_binary()
+    backup = get_backup_path()
+    if not binary.exists():
+        console.print(f"[red]Binary not found: {binary}[/]")
+        sys.exit(1)
+    if len(new_salt) != SALT_LEN:
+        console.print(f"[red]Salt must be exactly {SALT_LEN} chars (got {len(new_salt)})[/]")
+        sys.exit(1)
+
+    # Backup on first patch (only if binary has original SALT — avoid backing up already-patched binaries)
+    data = binary.read_bytes()
+    if not backup.exists():
+        console.print(f"[dim]Backing up → {backup}[/]")
+        shutil.copy2(binary, backup)
+
+    # Try to find the SALT to replace.
+    # Strategy: check original, tracked salt, then scan binary for any 15-char
+    # string adjacent to known companion code patterns.
+    old_salt = None
+    candidates = list(dict.fromkeys([ORIGINAL_SALT, get_current_salt()]))  # dedup, order preserved
+    for candidate in candidates:
+        if data.count(candidate.encode()) > 0:
+            old_salt = candidate
+            break
+
+    # If not found, try the backup
+    if old_salt is None and backup.exists():
+        backup_data = backup.read_bytes()
+        for candidate in candidates:
+            if backup_data.count(candidate.encode()) > 0:
+                console.print(f"[dim]Restoring from backup[/]")
+                shutil.copy2(backup, binary)
+                binary.chmod(0o755)
+                data = binary.read_bytes()
+                old_salt = candidate
+                break
+
+    # Last resort: scan binary for SALT near known JS context patterns.
+    # The SALT is stored as a JS variable like: HV4="<15chars>" (minified name varies).
+    # It appears 3 times: twice in JS source regions and once in Bun string table.
+    # We look for the JS assignment pattern, then verify the candidate appears 3 times.
+    if old_salt is None:
+        console.print("[dim]Scanning binary for current SALT...[/]")
+        import re as _re
+        text = data.decode("ascii", errors="ignore")
+        # Look for: var XXXXX,YYY="<15chars>",ZZZ  (the minified companion salt pattern)
+        # The SALT is always preceded by `var <something>,<varname>="` and followed by `",`
+        for m in _re.finditer(r'var \w+,(\w+)="([A-Za-z0-9_\-]{' + str(SALT_LEN) + r'})",\w+', text):
+            candidate = m.group(2)
+            occurrences = data.count(candidate.encode())
+            if occurrences == 3:  # SALT always appears exactly 3 times
+                console.print(f"[dim]Found SALT in binary: {candidate} ({occurrences}x)[/]")
+                old_salt = candidate
+                break
+
+    if old_salt is None:
+        console.print("[red]Cannot find any SALT in binary or backup.[/]")
+        console.print("[red]Try: buddy restore, then re-patch.[/]")
+        sys.exit(1)
+
+    new = new_salt.encode()
+    old = old_salt.encode()
+    count = data.count(old)
+    data = data.replace(old, new)
+    binary.write_bytes(data)
+    console.print(f"[dim]Replaced {count} occurrences ({old_salt} → {new_salt})[/]")
+
+    # Re-sign
+    if shutil.which("codesign"):
+        subprocess.run(["codesign", "--force", "--sign", "-", str(binary)],
+                       capture_output=True)
+        console.print("[dim]Binary re-signed[/]")
+
+    # Track salt
+    get_salt_file().write_text(new_salt)
+
+
+def patch_npm(target_uuid: str):
+    cli_js = get_npm_cli_js()
+    if not cli_js.exists():
+        console.print(f"[red]npm cli.js not found: {cli_js}[/]")
+        sys.exit(1)
+    backup = cli_js.with_suffix(".js.buddy-bak")
+    if not backup.exists():
+        shutil.copy2(cli_js, backup)
+
+    content = cli_js.read_text()
+    # Find companionUserId function — pattern: function NAME(){...oauthAccount?.accountUuid...}
+    pattern = r'function (\w+)\(\)\{let \w+=\w+\(\);return \w+\.oauthAccount\?\.accountUuid\?\?\w+\.userID\?\?"anon"\}'
+    match = re.search(pattern, content)
+    if not match:
+        # Try already-patched pattern
+        pattern2 = r'function (\w+)\(\)\{return"[0-9a-f-]+"\}'
+        match = re.search(pattern2, content)
+        if match:
+            fn_name = match.group(1)
+            old_fn = match.group(0)
+            new_fn = f'function {fn_name}(){{return"{target_uuid}"}}'
+            content = content.replace(old_fn, new_fn)
+            cli_js.write_text(content)
+            console.print(f"[dim]Patched {fn_name}() (was already patched, updated UUID)[/]")
+            return
+        console.print("[red]Could not find companionUserId function in cli.js[/]")
+        sys.exit(1)
+
+    fn_name = match.group(1)
+    old_fn = match.group(0)
+    new_fn = f'function {fn_name}(){{return"{target_uuid}"}}'
+    content = content.replace(old_fn, new_fn)
+    cli_js.write_text(content)
+    console.print(f"[dim]Patched {fn_name}() → returns hardcoded UUID[/]")
+
+
+def clear_companion(runtime: str = "native"):
+    config = read_config(runtime)
+    if "companion" in config:
+        name = config["companion"].get("name", "?")
+        del config["companion"]
+        write_config(config, runtime)
+        console.print(f'Cleared companion "{name}"')
+    else:
+        console.print("No companion to clear")
+
+
+# ── CLI ──
+
+@click.group(invoke_without_command=True)
+@click.option("--version", "-v", is_flag=True, help="Show version")
+@click.pass_context
+def cli(ctx, version):
+    """buddy — Claude Code companion reroller & manager"""
+    if version:
+        click.echo(f"buddy v{VERSION}")
+        return
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@cli.command()
+@click.argument("terms", nargs=-1, required=True)
+@click.option("--min-stat", "-m", multiple=True, help="Filter by min stat, e.g. DEBUGGING:90")
+@click.option("--sort", "-s", "sort_stat", help="Sort results by stat name")
+@click.option("--limit", "-l", default=25, help="Max results (default 25)")
+@click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
+def search(terms, min_stat, sort_stat, limit, runtime):
+    """Search for companions matching traits.
+
+    Examples:
+      buddy search legendary dragon wizard
+      buddy search "legendary shiny dragon" --min-stat DEBUGGING:90
+      buddy search epic cat --sort SNARK
+    """
+    user_id = get_user_id(runtime)
+    term_list = []
+    for t in terms:
+        term_list.extend(t.lower().split())
+
+    min_stats = {}
+    for ms in min_stat:
+        parts = ms.split(":")
+        if len(parts) == 2:
+            min_stats[parts[0].upper()] = int(parts[1])
+
+    console.print(f"[bold]Searching:[/] {' '.join(term_list)}")
+    console.print(f"[dim]User: {user_id[:8]}...  Runtime: {runtime}[/]")
+    if min_stats:
+        console.print(f"[dim]Min stats: {min_stats}[/]")
+    console.print("---")
+
+    if runtime == "native":
+        results = run_bun_search(user_id, term_list, limit, 50_000_000, min_stats, sort_stat)
+    else:
+        # Python-based search for npm (FNV-1a)
+        import secrets
+        results = []
+        searched = 0
+        while len(results) < limit and searched < 50_000_000:
+            salt = secrets.token_urlsafe(12)[:SALT_LEN]
+            r = roll_companion(user_id, salt, use_bun=False)
+            searched += 1
+            pool = [r["rarity"], r["species"], r["eye"], EYE_NAMES.get(r["eye"], ""),
+                    r["hat"], "shiny" if r["shiny"] else ""]
+            if all(any(t in p.lower() for p in pool) for t in term_list):
+                if all(r["stats"].get(k, 0) >= v for k, v in min_stats.items()):
+                    results.append(r)
+            if searched % 1_000_000 == 0 and len(results) < limit:
+                console.print(f"[dim]  ...{searched:,} searched, {len(results)} found[/]")
+        console.print(f"[dim]Found {len(results)} in {searched:,} rolls[/]")
+
+    if sort_stat and results:
+        results.sort(key=lambda r: r["stats"].get(sort_stat.upper(), 0), reverse=True)
+
+    for r in results:
+        color = RARITY_COLORS[r["rarity"]]
+        stars = RARITY_STARS[r["rarity"]]
+        shiny = "✨ " if r["shiny"] else ""
+        hat_str = f'[{r["hat"]}]' if r["hat"] != "none" else ""
+        best = max(r["stats"].items(), key=lambda x: x[1])
+        console.print(
+            f"[{color}]{stars}[/] {r['rarity'].upper()} {shiny}{r['species']} "
+            f"{r['eye']} {hat_str} | best: {best[0]}:{best[1]} | "
+            f"[dim]salt: {r['salt']}[/]"
+        )
+
+
+@cli.command()
+@click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
+def current(runtime):
+    """Show your current companion with sprite."""
+    user_id = get_user_id(runtime)
+    salt = get_current_salt() if runtime == "native" else ORIGINAL_SALT
+    use_bun = runtime == "native"
+    r = roll_companion(user_id, salt, use_bun=use_bun)
+
+    patched = salt != ORIGINAL_SALT
+    title = "Current companion"
+    if patched:
+        title += " [green](patched)[/]"
+    console.print(Panel(render_card(r), title=title, border_style=RARITY_COLORS[r["rarity"]]))
+
+    # Show stored soul if available
+    config = read_config(runtime)
+    comp = config.get("companion", {})
+    if comp:
+        console.print(f'  [bold]Name:[/] {comp.get("name", "?")}')
+        console.print(f'  [dim]{comp.get("personality", "")}[/]')
+
+
+@cli.command()
+@click.argument("salt")
+@click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
+def preview(salt, runtime):
+    """Preview a companion from a salt without patching."""
+    user_id = get_user_id(runtime)
+    use_bun = runtime == "native"
+    r = roll_companion(user_id, salt, use_bun=use_bun)
+    console.print(Panel(render_card(r), title="Preview", border_style=RARITY_COLORS[r["rarity"]]))
+
+
+@cli.command()
+@click.argument("salt")
+@click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
+def patch(salt, runtime):
+    """Apply a salt to get a specific companion.
+
+    For native: replaces SALT in binary.
+    For npm: patches companionUserId() to return a specific UUID.
+    """
+    user_id = get_user_id(runtime)
+    use_bun = runtime == "native"
+    r = roll_companion(user_id, salt, use_bun=use_bun)
+
+    console.print("[bold]You'll get:[/]")
+    console.print(Panel(render_card(r), border_style=RARITY_COLORS[r["rarity"]]))
+
+    if runtime == "native":
+        patch_native(salt)
+    else:
+        # For npm, salt IS the UUID to inject
+        patch_npm(salt)
+
+    clear_companion(runtime)
+    console.print(f"\n[green bold]Patched![/] Restart Claude Code → /buddy")
+
+
+@cli.command()
+def restore():
+    """Restore original binary (undo patch)."""
+    backup = get_backup_path()
+    binary = get_claude_binary()
+    if not backup.exists():
+        console.print("No backup found — binary is original.")
+        return
+    shutil.copy2(backup, binary)
+    binary.chmod(0o755)
+    if shutil.which("codesign"):
+        subprocess.run(["codesign", "--force", "--sign", "-", str(binary)], capture_output=True)
+    get_salt_file().unlink(missing_ok=True)
+    clear_companion()
+    console.print("[green]Restored to original.[/] Restart Claude Code.")
+
+
+@cli.command()
+@click.argument("new_name")
+@click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
+def name(new_name, runtime):
+    """Set a custom companion name."""
+    config = read_config(runtime)
+    if "companion" not in config:
+        console.print("No companion hatched yet. Run /buddy in Claude Code first.")
+        return
+    old = config["companion"].get("name", "?")
+    config["companion"]["name"] = new_name
+    write_config(config, runtime)
+    console.print(f"Renamed: {old} → {new_name}")
+
+
+@cli.command()
+@click.argument("text")
+@click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
+def personality(text, runtime):
+    """Set a custom companion personality description."""
+    config = read_config(runtime)
+    if "companion" not in config:
+        console.print("No companion hatched yet. Run /buddy in Claude Code first.")
+        return
+    config["companion"]["personality"] = text
+    write_config(config, runtime)
+    console.print(f"Personality updated.")
+
+
+@cli.command()
+@click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
+def clear(runtime):
+    """Clear companion data for re-hatch."""
+    clear_companion(runtime)
+    console.print("Next /buddy will generate a new name & personality.")
+
+
+@cli.command(name="export")
+@click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
+def export_cmd(runtime):
+    """Export current companion as JSON."""
+    user_id = get_user_id(runtime)
+    salt = get_current_salt() if runtime == "native" else ORIGINAL_SALT
+    r = roll_companion(user_id, salt, use_bun=(runtime == "native"))
+    config = read_config(runtime)
+    comp = config.get("companion", {})
+    r["name"] = comp.get("name")
+    r["personality"] = comp.get("personality")
+    click.echo(json.dumps(r, indent=2, ensure_ascii=False))
+
+
+@cli.command()
+@click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
+def sprite(runtime):
+    """Show just the ASCII art of your current companion."""
+    user_id = get_user_id(runtime)
+    salt = get_current_salt() if runtime == "native" else ORIGINAL_SALT
+    r = roll_companion(user_id, salt, use_bun=(runtime == "native"))
+    color = RARITY_COLORS[r["rarity"]]
+    lines = render_sprite(r["species"], r["eye"], r["hat"])
+    for line in lines:
+        console.print(f"[{color}]{line}[/]")
+
+
+@cli.command()
+def info():
+    """Explain how the buddy system works."""
+    console.print(Panel.fit(
+        "[bold]hash(userId + SALT)[/] → Mulberry32 PRNG → roll chain\n\n"
+        "[bold]Roll order:[/]\n"
+        "  1. Rarity   — common(60%) uncommon(25%) rare(10%) epic(4%) legendary(1%)\n"
+        "  2. Species  — 18 types, equal probability (1/18 each)\n"
+        "  3. Eye      — 6 styles: · ✦ × ◉ @ °\n"
+        "  4. Hat      — 7 types (common=none): crown tophat propeller halo wizard beanie tinyduck\n"
+        "  5. Shiny    — 1% chance, independent of rarity\n"
+        "  6. Stats    — 5 stats with peak/dump, floor based on rarity\n\n"
+        "[bold]What we patch:[/]\n"
+        f"  The SALT string in the binary. Original: [dim]{ORIGINAL_SALT}[/] ({SALT_LEN} chars)\n\n"
+        "[bold]What persists in config:[/]\n"
+        "  Only name + personality. Everything else recomputes from hash.\n\n"
+        "[bold]Native vs npm:[/]\n"
+        "  Native uses Bun.hash() — this tool targets native by default.\n"
+        "  npm uses FNV-1a — use [bold]--runtime npm[/] for claudesp.",
+        title="How the Buddy System Works",
+    ))
+
+
+if __name__ == "__main__":
+    cli()
