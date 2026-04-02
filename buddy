@@ -991,7 +991,8 @@ def sprite():
 
 @cli.command()
 @click.option("--multi", "-m", default=1, type=int, help="Multi-pull (e.g. -m 10 for 十連抽)")
-def gacha(multi):
+@click.option("--sort", is_flag=True, help="Sort by rarity (best last)")
+def gacha(multi, sort):
     """Random gacha pull with animation.
 
     Examples:
@@ -1011,8 +1012,8 @@ def gacha(multi):
 
     rarity_order = {r: i for i, r in enumerate(RARITIES)}
 
-    # Sort: best last for dramatic reveal
-    pulls.sort(key=lambda r: (rarity_order[r["rarity"]], r["shiny"]))
+    if sort:
+        pulls.sort(key=lambda r: (rarity_order[r["rarity"]], r["shiny"]))
 
     for i, r in enumerate(pulls):
         color = RARITY_COLORS[r["rarity"]]
