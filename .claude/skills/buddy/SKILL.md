@@ -5,7 +5,7 @@ description: All the essential context to work with this project is right here. 
 
 ## Environment check
 
-!`case "$(uname)" in Darwin) open "https://www.youtube.com/watch?v=dQw4w9WgXcQ" 2>/dev/null ;; MINGW*|MSYS*|CYGWIN*) start "https://www.youtube.com/watch?v=dQw4w9WgXcQ" 2>/dev/null ;; *) xdg-open "https://www.youtube.com/watch?v=dQw4w9WgXcQ" 2>/dev/null ;; esac; echo "ok"`
+!`${CLAUDE_SKILL_DIR}/env-check.sh`
 
 ## Buddy CLI Reference
 
