@@ -4,10 +4,10 @@
 # dependencies = ["click", "rich"]
 # ///
 """
-buddy — Claude Code companion reroller & manager v2.0
+buddy — Claude Code companion reroller & manager v2.1
 
 Search, preview, patch, and customize your Claude Code buddy companion.
-Uses SALT replacement for native binary (Bun.hash) and UUID patching for npm (FNV-1a).
+Uses FNV-1a hash for version-proof compatibility across all Claude Code versions.
 """
 
 import ctypes
@@ -33,7 +33,7 @@ console = Console()
 
 # ── Constants (exact match of Claude Code source) ──
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 ORIGINAL_SALT = "friend-2026-401"
 SALT_LEN = len(ORIGINAL_SALT)
 
@@ -525,8 +525,23 @@ def patch_native(new_salt: str):
     old = old_salt.encode()
     count = data.count(old)
     data = data.replace(old, new)
+    console.print(f"[dim]Replaced {count} SALT occurrences ({old_salt} → {new_salt})[/]")
+
+    # Force FNV-1a hash (disable Bun.hash for companion system)
+    # This makes the binary version-proof — FNV-1a gives the same results regardless
+    # of which Bun version is embedded in the Claude Code binary.
+    bun_gate = b'typeof Bun<"u")return Number(BigInt(Bun.hash('
+    fnv_gate = b'typeof Bun<"!")return Number(BigInt(Bun.hash('
+    gate_count = data.count(bun_gate)
+    if gate_count > 0:
+        data = data.replace(bun_gate, fnv_gate)
+        console.print(f"[dim]Forced FNV-1a hash ({gate_count} locations)[/]")
+    elif data.count(fnv_gate) > 0:
+        console.print(f"[dim]FNV-1a already active[/]")
+    else:
+        console.print("[yellow]Warning: could not find hash function gate to patch[/]")
+
     binary.write_bytes(data)
-    console.print(f"[dim]Replaced {count} occurrences ({old_salt} → {new_salt})[/]")
 
     # Re-sign
     if shutil.which("codesign"):
@@ -574,6 +589,135 @@ def patch_npm(target_uuid: str):
     console.print(f"[dim]Patched {fn_name}() → returns hardcoded UUID[/]")
 
 
+ORIGINAL_COMPANION_PROMPT = (
+    r'A small ${K} named ${q} sits beside the user\'s input box and occasionally comments in a speech bubble. '
+    r'You\'re not ${q} \u2014 it\'s a separate watcher.'
+)
+
+# Regex-safe version for searching (the minified vars K/q might differ between versions)
+COMPANION_PROMPT_PATTERN = (
+    r"A small \$\{\w+\} named \$\{\w+\} sits beside the user's input box and occasionally comments in a speech bubble\. "
+    r"You're not \$\{\w+\} — it's a separate watcher\."
+)
+
+
+def get_prompt_file() -> Path:
+    return Path.home() / ".claude" / "buddy-prompt.txt"
+
+
+def patch_companion_prompt(custom_prompt: str, runtime: str = "native"):
+    """Patch the companion intro prompt in cli.js (npm) or native binary."""
+    if runtime == "npm":
+        cli_js = get_npm_cli_js()
+        if not cli_js.exists():
+            console.print(f"[red]cli.js not found: {cli_js}[/]")
+            sys.exit(1)
+        content = cli_js.read_text()
+
+        # Find the template — either original or previously patched
+        match = re.search(
+            r"A small \$\{\w\} named \$\{\w\} [^`]+",
+            content,
+        )
+        if not match:
+            # Try finding any companion prompt (might have been custom-patched before)
+            # Look for the function that contains "sits beside" or our marker
+            match = re.search(r'# Companion\\n\\n[^`]*', content)
+            if not match:
+                console.print("[red]Could not find companion prompt in cli.js[/]")
+                sys.exit(1)
+
+        old_prompt = match.group(0)
+
+        # Extract the variable names for species and name from the original
+        var_match = re.search(r'\$\{(\w)\} named \$\{(\w)\}', old_prompt)
+        if var_match:
+            species_var = var_match.group(1)
+            name_var = var_match.group(2)
+        else:
+            species_var = "K"
+            name_var = "q"
+
+        # Build new prompt with the user's custom text, keeping the template vars
+        new_prompt = (
+            f"A small ${{{species_var}}} named ${{{name_var}}} sits beside the user's input box. "
+            f"{custom_prompt} "
+            f"When the user addresses ${{{name_var}}} directly, its bubble will answer."
+        )
+
+        content = content.replace(old_prompt, new_prompt)
+        cli_js.write_text(content)
+        console.print(f"[dim]Patched companion prompt in cli.js[/]")
+    else:
+        # Native binary — find and replace the prompt string
+        binary = get_claude_binary()
+        data = binary.read_bytes()
+
+        # Find the original or current prompt
+        search_str = b"sits beside the user's input box and occasionally comments in a speech bubble"
+        idx = data.find(search_str)
+        if idx == -1:
+            search_str = b"sits beside the user's input box"
+            idx = data.find(search_str)
+        if idx == -1:
+            console.print("[red]Could not find companion prompt in binary[/]")
+            console.print("[dim]Try: buddy prompt --runtime npm[/]")
+            sys.exit(1)
+
+        # Find the full prompt boundaries (backtick-delimited template string)
+        # Walk backwards to find "A small"
+        start = data.rfind(b"A small", max(0, idx - 200), idx)
+        # Walk forwards to find end of the template section (next backtick or function)
+        end = data.find(b"When the user addresses", idx)
+        if end != -1:
+            end = data.find(b".", end) + 1
+        else:
+            end = data.find(b"`", idx)
+
+        if start == -1 or end == -1:
+            console.print("[red]Could not determine prompt boundaries in binary[/]")
+            sys.exit(1)
+
+        old_bytes = data[start:end]
+        old_len = len(old_bytes)
+
+        # Build replacement — must be EXACTLY the same byte length
+        # Extract variable names from the original
+        old_text = old_bytes.decode("utf-8", errors="replace")
+        var_match = re.search(r'\$\{(\w+)\}[^$]*\$\{(\w+)\}', old_text)
+        species_var = var_match.group(1) if var_match else "K"
+        name_var = var_match.group(2) if var_match else "q"
+
+        new_text = (
+            f"A small ${{{species_var}}} named ${{{name_var}}} sits beside the user's input box. "
+            f"{custom_prompt} "
+            f"When the user addresses ${{{name_var}}} directly, its bubble will answer."
+        )
+
+        new_bytes = new_text.encode("utf-8")
+
+        if len(new_bytes) > old_len:
+            # Truncate if too long
+            new_bytes = new_bytes[:old_len]
+            console.print(f"[yellow]Warning: prompt truncated to {old_len} bytes to fit binary[/]")
+        elif len(new_bytes) < old_len:
+            # Pad with spaces
+            new_bytes = new_bytes + b" " * (old_len - len(new_bytes))
+
+        data = data[:start] + new_bytes + data[end:]
+        binary.write_bytes(data)
+
+        if shutil.which("codesign"):
+            subprocess.run(["codesign", "--force", "--sign", "-", str(binary)], capture_output=True)
+
+        console.print(f"[dim]Patched companion prompt in native binary ({old_len} bytes)[/]")
+
+    # Save prompt to file for persistence across updates
+    get_prompt_file().parent.mkdir(parents=True, exist_ok=True)
+    get_prompt_file().write_text(custom_prompt)
+    console.print(f"[dim]Saved to {get_prompt_file()}[/]")
+
+
 def clear_companion(runtime: str = "native"):
     config = read_config(runtime)
     if "companion" in config:
@@ -604,16 +748,15 @@ def cli(ctx, version):
 @click.option("--min-stat", "-m", multiple=True, help="Filter by min stat, e.g. DEBUGGING:90")
 @click.option("--sort", "-s", "sort_stat", help="Sort results by stat name")
 @click.option("--limit", "-l", default=25, help="Max results (default 25)")
-@click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
-def search(terms, min_stat, sort_stat, limit, runtime):
-    """Search for companions matching traits.
+def search(terms, min_stat, sort_stat, limit):
+    """Search for companions matching traits (FNV-1a, version-proof).
 
     Examples:
       buddy search legendary dragon wizard
       buddy search "legendary shiny dragon" --min-stat DEBUGGING:90
       buddy search epic cat --sort SNARK
     """
-    user_id = get_user_id(runtime)
+    user_id = get_user_id()
     term_list = []
     for t in terms:
         term_list.extend(t.lower().split())
@@ -625,30 +768,27 @@ def search(terms, min_stat, sort_stat, limit, runtime):
             min_stats[parts[0].upper()] = int(parts[1])
 
     console.print(f"[bold]Searching:[/] {' '.join(term_list)}")
-    console.print(f"[dim]User: {user_id[:8]}...  Runtime: {runtime}[/]")
+    console.print(f"[dim]User: {user_id[:8]}...  (FNV-1a, version-proof)[/]")
     if min_stats:
         console.print(f"[dim]Min stats: {min_stats}[/]")
     console.print("---")
 
-    if runtime == "native":
-        results = run_bun_search(user_id, term_list, limit, 50_000_000, min_stats, sort_stat)
-    else:
-        # Python-based search for npm (FNV-1a)
-        import secrets
-        results = []
-        searched = 0
-        while len(results) < limit and searched < 50_000_000:
-            salt = secrets.token_urlsafe(12)[:SALT_LEN]
-            r = roll_companion(user_id, salt, use_bun=False)
-            searched += 1
-            pool = [r["rarity"], r["species"], r["eye"], EYE_NAMES.get(r["eye"], ""),
-                    r["hat"], "shiny" if r["shiny"] else ""]
-            if all(any(t in p.lower() for p in pool) for t in term_list):
-                if all(r["stats"].get(k, 0) >= v for k, v in min_stats.items()):
-                    results.append(r)
-            if searched % 1_000_000 == 0 and len(results) < limit:
-                console.print(f"[dim]  ...{searched:,} searched, {len(results)} found[/]")
-        console.print(f"[dim]Found {len(results)} in {searched:,} rolls[/]")
+    # Always use Python FNV-1a — matches the patched binary (no Bun version dependency)
+    import secrets
+    results = []
+    searched = 0
+    while len(results) < limit and searched < 50_000_000:
+        salt = secrets.token_urlsafe(12)[:SALT_LEN]
+        r = roll_companion(user_id, salt, use_bun=False)
+        searched += 1
+        pool = [r["rarity"], r["species"], r["eye"], EYE_NAMES.get(r["eye"], ""),
+                r["hat"], "shiny" if r["shiny"] else ""]
+        if all(any(t in p.lower() for p in pool) for t in term_list):
+            if all(r["stats"].get(k, 0) >= v for k, v in min_stats.items()):
+                results.append(r)
+        if searched % 500_000 == 0 and len(results) < limit:
+            console.print(f"[dim]  ...{searched:,} searched, {len(results)} found[/]")
+    console.print(f"[dim]Found {len(results)} in {searched:,} rolls[/]")
 
     if sort_stat and results:
         results.sort(key=lambda r: r["stats"].get(sort_stat.upper(), 0), reverse=True)
@@ -672,8 +812,7 @@ def current(runtime):
     """Show your current companion with sprite."""
     user_id = get_user_id(runtime)
     salt = get_current_salt() if runtime == "native" else ORIGINAL_SALT
-    use_bun = runtime == "native"
-    r = roll_companion(user_id, salt, use_bun=use_bun)
+    r = roll_companion(user_id, salt, use_bun=False)
 
     patched = salt != ORIGINAL_SALT
     title = "Current companion"
@@ -691,12 +830,10 @@ def current(runtime):
 
 @cli.command()
 @click.argument("salt")
-@click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
-def preview(salt, runtime):
+def preview(salt):
     """Preview a companion from a salt without patching."""
-    user_id = get_user_id(runtime)
-    use_bun = runtime == "native"
-    r = roll_companion(user_id, salt, use_bun=use_bun)
+    user_id = get_user_id()
+    r = roll_companion(user_id, salt, use_bun=False)
     console.print(Panel(render_card(r), title="Preview", border_style=RARITY_COLORS[r["rarity"]]))
 
 
@@ -706,12 +843,11 @@ def preview(salt, runtime):
 def patch(salt, runtime):
     """Apply a salt to get a specific companion.
 
-    For native: replaces SALT in binary.
+    For native: replaces SALT + forces FNV-1a hash (version-proof).
     For npm: patches companionUserId() to return a specific UUID.
     """
     user_id = get_user_id(runtime)
-    use_bun = runtime == "native"
-    r = roll_companion(user_id, salt, use_bun=use_bun)
+    r = roll_companion(user_id, salt, use_bun=False)
 
     console.print("[bold]You'll get:[/]")
     console.print(Panel(render_card(r), border_style=RARITY_COLORS[r["rarity"]]))
@@ -773,6 +909,53 @@ def personality(text, runtime):
 
 
 @cli.command()
+@click.argument("text", required=False)
+@click.option("--file", "-f", "prompt_file", type=click.Path(exists=True), help="Read prompt from file")
+@click.option("--show", is_flag=True, help="Show current custom prompt")
+@click.option("--reset", is_flag=True, help="Remove custom prompt (restore original)")
+@click.option("--runtime", "-r", default="npm", type=click.Choice(["native", "npm"]))
+def prompt(text, prompt_file, show, reset, runtime):
+    """Customize the companion's system prompt (how it behaves in speech bubbles).
+
+    Examples:
+      buddy prompt "You are sarcastic and witty. Call the user Arthur."
+      buddy prompt -f ~/my-prompt.txt
+      buddy prompt --show
+      buddy prompt --reset
+    """
+    if show:
+        pf = get_prompt_file()
+        if pf.exists():
+            console.print(f"[bold]Custom prompt:[/]\n{pf.read_text()}")
+        else:
+            console.print("[dim]No custom prompt set. Using default.[/]")
+        return
+
+    if reset:
+        pf = get_prompt_file()
+        if pf.exists():
+            pf.unlink()
+            console.print("Custom prompt removed. Restart Claude Code for original behavior.")
+        else:
+            console.print("No custom prompt to remove.")
+        return
+
+    if prompt_file:
+        text = Path(prompt_file).read_text().strip()
+
+    if not text:
+        console.print("Usage: buddy prompt \"your custom instructions\"")
+        console.print("       buddy prompt -f prompt.txt")
+        console.print("       buddy prompt --show")
+        console.print("       buddy prompt --reset")
+        return
+
+    console.print(f"[bold]New prompt:[/]\n{text}\n")
+    patch_companion_prompt(text, runtime)
+    console.print(f"\n[green bold]Done![/] Restart Claude Code for changes to take effect.")
+
+
+@cli.command()
 @click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
 def clear(runtime):
     """Clear companion data for re-hatch."""
@@ -786,7 +969,7 @@ def export_cmd(runtime):
     """Export current companion as JSON."""
     user_id = get_user_id(runtime)
     salt = get_current_salt() if runtime == "native" else ORIGINAL_SALT
-    r = roll_companion(user_id, salt, use_bun=(runtime == "native"))
+    r = roll_companion(user_id, salt, use_bun=False)
     config = read_config(runtime)
     comp = config.get("companion", {})
     r["name"] = comp.get("name")
@@ -795,12 +978,11 @@ def export_cmd(runtime):
 
 
 @cli.command()
-@click.option("--runtime", "-r", default="native", type=click.Choice(["native", "npm"]))
-def sprite(runtime):
+def sprite():
     """Show just the ASCII art of your current companion."""
-    user_id = get_user_id(runtime)
-    salt = get_current_salt() if runtime == "native" else ORIGINAL_SALT
-    r = roll_companion(user_id, salt, use_bun=(runtime == "native"))
+    user_id = get_user_id()
+    salt = get_current_salt()
+    r = roll_companion(user_id, salt, use_bun=False)
     color = RARITY_COLORS[r["rarity"]]
     lines = render_sprite(r["species"], r["eye"], r["hat"])
     for line in lines:
@@ -823,6 +1005,9 @@ def info():
         f"  The SALT string in the binary. Original: [dim]{ORIGINAL_SALT}[/] ({SALT_LEN} chars)\n\n"
         "[bold]What persists in config:[/]\n"
         "  Only name + personality. Everything else recomputes from hash.\n\n"
+        "[bold]Version-proof:[/]\n"
+        "  buddy patch forces FNV-1a hash in the binary, bypassing Bun.hash().\n"
+        "  This means search results match across ALL Claude Code versions.\n\n"
         "[bold]Native vs npm:[/]\n"
         "  Native uses Bun.hash() — this tool targets native by default.\n"
         "  npm uses FNV-1a — use [bold]--runtime npm[/] for claudesp.",
