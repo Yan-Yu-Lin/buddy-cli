@@ -1023,7 +1023,7 @@ def gacha(multi):
         # Star animation for epic+
         if rarity_idx >= 3:
             if multi > 1:
-                console.print(f"\n[dim]Pull {i+1}/{multi}[/]", end="  ")
+                console.print(f"\n[dim]Pull {i+1}/{multi}[/]", end="  ", justify="center")
             for s in range(1, rarity_idx + 2):
                 console.print(f"[{color}]★[/]", end="")
                 time.sleep(0.25)
@@ -1031,7 +1031,7 @@ def gacha(multi):
             time.sleep(0.15)
         else:
             if multi > 1:
-                console.print(f"\n[dim]Pull {i+1}/{multi}[/]")
+                console.print(f"\n[dim]Pull {i+1}/{multi}[/]", justify="center")
             time.sleep(0.08)
 
         # Build card content
@@ -1058,7 +1058,7 @@ def gacha(multi):
         # Panel border style based on rarity
         border = "heavy" if rarity_idx >= 4 else "rounded" if rarity_idx >= 3 else "round"
         title = f"Pull {i+1}/{multi}" if multi > 1 else "Gacha Pull"
-        console.print(Panel("\n".join(lines), title=title, border_style=color))
+        console.print(Panel("\n".join(lines), title=title, border_style=color, width=42, expand=False), justify="center")
 
         if multi > 1 and i < multi - 1:
             time.sleep(0.1)
@@ -1075,15 +1075,15 @@ def gacha(multi):
         shiny_count = sum(1 for r in pulls if r["shiny"])
         if shiny_count:
             summary_lines.append(f"  ✨ Shiny: {shiny_count}")
-        console.print(Panel("\n".join(summary_lines), title=f"Summary ({multi} pulls)", border_style="bold"))
+        console.print(Panel("\n".join(summary_lines), title=f"Summary ({multi} pulls)", border_style="bold", width=42, expand=False), justify="center")
 
     # Show best pull patch command
     best_pull = max(pulls, key=lambda r: (rarity_order[r["rarity"]], r["shiny"]))
     best_rarity = rarity_order[best_pull["rarity"]]
     if best_rarity >= 2 or best_pull["shiny"]:
         color = RARITY_COLORS[best_pull["rarity"]]
-        console.print(f"\n[{color} bold]Best: {RARITY_STARS[best_pull['rarity']]} {best_pull['rarity'].upper()} {best_pull['species'].upper()}[/]")
-        console.print(f"[dim]Use it → buddy patch {best_pull['salt']}[/]")
+        console.print(f"\n[{color} bold]Best: {RARITY_STARS[best_pull['rarity']]} {best_pull['rarity'].upper()} {best_pull['species'].upper()}[/]", justify="center")
+        console.print(f"[dim]Use it → buddy patch {best_pull['salt']}[/]", justify="center")
 
 
 @cli.command()
