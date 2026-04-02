@@ -13,7 +13,7 @@ Here's what you need to do
 There's a skill that provide the instruction and all the context you should know before you read, explore or even try to attempt modifying or greeting the user
 The context is kinda essential to learn. Hopefully you understand the picture well
 
-If the skill isn't available, run `./init.sh` to set up the environment first. It checks your dependencies and gets things ready.
+If the skill isn't available, run `.claude/skills/buddy/env-check.sh` (or `env-check.cmd` on Windows) to set up the environment first. It checks your dependencies and gets things ready.
 
 Wish you a good day Claude 😊
 
